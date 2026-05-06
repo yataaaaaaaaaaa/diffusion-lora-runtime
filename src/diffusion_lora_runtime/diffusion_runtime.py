@@ -8,6 +8,7 @@ import inspect
 import random
 import re
 import threading
+import tempfile
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -283,14 +284,134 @@ class DiffusionRuntime:
         except Exception as exc:
             return f"summary_failed={exc}"
 
+
+    def _read_adapter_state_dict(self, path: Path) -> dict[str, torch.Tensor]:
+        if path.suffix.casefold() == ".safetensors":
+            from safetensors.torch import load_file
+
+            return load_file(str(path), device="cpu")
+        payload = torch.load(str(path), map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict):
+            raise ValueError(f"LoRA file payload must be a state dict, got {type(payload).__name__}")
+        return payload
+
+    def _write_adapter_state_dict(self, state_dict: dict[str, torch.Tensor], path: Path) -> None:
+        if path.suffix.casefold() == ".safetensors":
+            from safetensors.torch import save_file
+
+            save_file(state_dict, str(path))
+        else:
+            torch.save(state_dict, str(path))
+
+    def _fold_lora_mid_weights_for_diffusers(
+        self, state_dict: dict[str, torch.Tensor]
+    ) -> tuple[dict[str, torch.Tensor], int]:
+        """Fold Kohya/ComfyUI LoCon ``lora_mid`` tensors into ``lora_down`` tensors.
+
+        Diffusers' LoRA loader expects a two-factor adapter (down/up). Some
+        ComfyUI-compatible LoCon files store convolutional adapters as three
+        factors (down/mid/up). For these files, leaving ``lora_mid.weight`` in
+        the state dict makes Diffusers fail during key conversion with
+        "keys have not been correctly renamed".
+
+        The transformation below is mathematically equivalent to ComfyUI's
+        LoCon merge path: it materializes the effective down convolution and
+        removes the separate mid tensor before handing the file to Diffusers.
+        """
+        converted = dict(state_dict)
+        folded = 0
+        mid_suffix = ".lora_mid.weight"
+
+        for mid_key in [key for key in converted if key.endswith(mid_suffix)]:
+            prefix = mid_key[: -len(mid_suffix)]
+            down_key = f"{prefix}.lora_down.weight"
+            if down_key not in converted:
+                continue
+
+            down = converted[down_key].detach().cpu()
+            mid = converted[mid_key].detach().cpu()
+
+            if mid.ndim == 4:
+                if down.ndim == 2:
+                    down_2d = down
+                    input_dim = down.shape[1]
+                elif down.ndim == 4:
+                    if any(size != 1 for size in down.shape[2:]):
+                        raise ValueError(
+                            f"Cannot fold {mid_key}: lora_down already has a non-1x1 kernel, "
+                            f"shape={tuple(down.shape)}"
+                        )
+                    down_2d = down.reshape(down.shape[0], down.shape[1])
+                    input_dim = down.shape[1]
+                else:
+                    raise ValueError(
+                        f"Unsupported lora_down rank for {down_key}: shape={tuple(down.shape)}"
+                    )
+
+                if down_2d.shape[0] != mid.shape[1]:
+                    raise ValueError(
+                        f"Cannot fold {mid_key}: down rank {down_2d.shape[0]} does not match "
+                        f"mid input rank {mid.shape[1]}"
+                    )
+                effective_down = (
+                    down_2d.transpose(0, 1)
+                    @ mid.transpose(0, 1).flatten(start_dim=1)
+                ).reshape(input_dim, mid.shape[0], mid.shape[2], mid.shape[3]).transpose(0, 1)
+            elif mid.ndim == 2:
+                if down.ndim != 2:
+                    raise ValueError(
+                        f"Unsupported linear lora_down shape for {down_key}: shape={tuple(down.shape)}"
+                    )
+                if down.shape[0] != mid.shape[1]:
+                    raise ValueError(
+                        f"Cannot fold {mid_key}: down rank {down.shape[0]} does not match "
+                        f"mid input rank {mid.shape[1]}"
+                    )
+                effective_down = mid @ down
+            else:
+                raise ValueError(f"Unsupported lora_mid shape for {mid_key}: shape={tuple(mid.shape)}")
+
+            converted[down_key] = effective_down.to(dtype=down.dtype)
+            del converted[mid_key]
+            folded += 1
+
+        return converted, folded
+
+    @contextmanager
+    def _diffusers_adapter_load_file(self, path: Path):
+        if not path.is_file() or path.suffix.casefold() not in {".safetensors", ".pt", ".pth", ".bin"}:
+            yield path
+            return
+
+        state_dict = self._read_adapter_state_dict(path)
+        if not any(key.endswith(".lora_mid.weight") for key in state_dict):
+            yield path
+            return
+
+        converted, folded = self._fold_lora_mid_weights_for_diffusers(state_dict)
+        if folded == 0:
+            yield path
+            return
+
+        with tempfile.TemporaryDirectory(prefix="diffusion-lora-locon-") as tmpdir:
+            load_path = Path(tmpdir) / path.name
+            self._write_adapter_state_dict(converted, load_path)
+            logger.info(
+                "Folded %d lora_mid tensors into lora_down tensors before Diffusers LoRA load: %s",
+                folded,
+                path,
+            )
+            yield load_path
+
     def _load_single_adapter(self, spec: LoRASpec) -> None:
         assert self.pipe is not None
         path = Path(spec.path)
         try:
             if path.is_file():
-                self.pipe.load_lora_weights(
-                    str(path.parent), weight_name=path.name, adapter_name=spec.id
-                )
+                with self._diffusers_adapter_load_file(path) as load_path:
+                    self.pipe.load_lora_weights(
+                        str(load_path.parent), weight_name=load_path.name, adapter_name=spec.id
+                    )
             else:
                 self.pipe.load_lora_weights(str(path), adapter_name=spec.id)
         except Exception as exc:
