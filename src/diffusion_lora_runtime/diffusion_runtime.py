@@ -295,11 +295,27 @@ class DiffusionRuntime:
             raise ValueError(f"LoRA file payload must be a state dict, got {type(payload).__name__}")
         return payload
 
+    def _contiguous_adapter_state_dict(self, state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """Return tensors in a layout accepted by safetensors.
+
+        Some LoCon folding operations above intentionally use transpose/reshape
+        views. Those views are mathematically correct, but safetensors requires
+        tensors to be packed contiguously before serialization.
+        """
+        contiguous_state_dict: dict[str, torch.Tensor] = {}
+        for key, tensor in state_dict.items():
+            if isinstance(tensor, torch.Tensor):
+                tensor = tensor.detach()
+                if not tensor.is_contiguous():
+                    tensor = tensor.contiguous()
+            contiguous_state_dict[key] = tensor
+        return contiguous_state_dict
+
     def _write_adapter_state_dict(self, state_dict: dict[str, torch.Tensor], path: Path) -> None:
         if path.suffix.casefold() == ".safetensors":
             from safetensors.torch import save_file
 
-            save_file(state_dict, str(path))
+            save_file(self._contiguous_adapter_state_dict(state_dict), str(path))
         else:
             torch.save(state_dict, str(path))
 
