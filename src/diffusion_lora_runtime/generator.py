@@ -6,7 +6,8 @@ from typing import Iterable
 
 from PIL import Image
 
-from .diffusion_runtime import AdapterLoadError, DiffusionRuntime, GenerationCancelled
+from .diffusion_runtime import AdapterLoadError, DiffusionRuntime, GenerationCancelled, path_key
+from .ip_adapter import ReferenceImageError, open_reference_images
 from .prompt_embedding import (
     PromptEmbeddingResolutionError,
     extract_prompt_embedding_names,
@@ -19,6 +20,7 @@ from .prompt_lora import (
 )
 from .schemas import (
     GenerateResult,
+    IPAdapterSpec,
     KSampleConfig,
     LoRASpec,
     ModelSpec,
@@ -52,7 +54,8 @@ class DiffusionGenerator:
                 on CPU.
         """
         self.runtime = DiffusionRuntime(device=device, allow_cpu=allow_cpu)
-        self._loaded_signature: tuple[str, tuple[tuple[str, float], ...]] | None = None
+        # Key of the loaded base model (see _model_key): only a change of it unloads the pipeline.
+        self._loaded_model_key: str | None = None
 
     def generate(
         self,
@@ -75,15 +78,25 @@ class DiffusionGenerator:
         output_path: str | Path | None = None,
         progress_callback: ProgressCallback | None = None,
         step_callback: StepCallback | None = None,
+        ip_adapter: IPAdapterSpec | None = None,
     ) -> GenerateResult:
-        """Generate one image and keep the current model/LoRA set in memory.
+        """Generate one image and keep the current model, LoRA set and IP-Adapter in memory.
 
-        The currently loaded model and LoRA signature is reused across calls.
-        If a later call asks for a different model path, dtype, LoRA path, or
-        LoRA weight, the previous pipeline is unloaded before the new one is
-        prepared. Inline prompt LoRA tags count as part of that LoRA signature.
+        ``ip_adapter``: reference images applied through an IP-Adapter (see IPAdapterSpec); None generates without
+        (an IP-Adapter loaded by an earlier call is unloaded, the base model stays loaded). The reference images are
+        opened before anything is loaded: a missing or unreadable one (or none) raises ReferenceImageError, a
+        ValueError.
+
+        Only a change of the base model (path, dtype, sampler or scheduler) unloads the previous pipeline before the
+        new one is loaded. Everything else is updated in place on the loaded pipeline:
+
+        - LoRAs (explicit and inline ``<lora:name:weight>`` tags, merged first): only added LoRAs are loaded and only
+          removed ones are deleted; a weight-only change just re-applies the weights; an unchanged set calls nothing;
+        - the IP-Adapter is loaded, swapped, re-scaled or unloaded as requested;
+        - textual inversions stay loaded.
         """
 
+        reference_images = open_reference_images(ip_adapter.image_paths) if ip_adapter is not None else None
         config = self._resolve_ksampler(ksample, width=width, height=height, steps=steps, cfg=cfg, seed=seed)
         model = ModelSpec.from_path(
             model_path,
@@ -104,15 +117,17 @@ class DiffusionGenerator:
             ),
         )
 
-        signature = self._signature(model, resolved_prompt.loras, resolved_prompt.lora_weights, config)
+        model_key = self._model_key(model, config)
         with self.runtime.serialized_operation():
-            if self._loaded_signature is not None and self._loaded_signature != signature:
+            if self._loaded_model_key is not None and self._loaded_model_key != model_key:
                 self.runtime.unload()
-                self._loaded_signature = None
+                self._loaded_model_key = None
 
             self.runtime.configure_ksampler(sampler_name=config.sampler_name, scheduler_name=config.scheduler)
             self.runtime.ensure_model(model)
+            self._loaded_model_key = model_key
             self.runtime.ensure_adapters(resolved_prompt.loras, adapter_weights=resolved_prompt.lora_weights)
+            self.runtime.ensure_ip_adapter(ip_adapter)
 
             embedding_references = []
             if prompt_embedding_dir is not None:
@@ -142,8 +157,8 @@ class DiffusionGenerator:
                 seed=config.seed,
                 progress_callback=progress_callback,
                 step_callback=step_callback,
+                ip_adapter_images=reference_images,
             )
-            self._loaded_signature = signature
 
         saved_path: str | None = None
         if output_path is not None:
@@ -170,11 +185,11 @@ class DiffusionGenerator:
         )
 
     def unload(self) -> None:
-        """Release any loaded model/LoRA/textual-inversion state and CUDA cache."""
+        """Release any loaded model/LoRA/IP-Adapter/textual-inversion state and CUDA cache."""
         with self.runtime.serialized_operation():
             self.runtime.cancel_current_generation()
             self.runtime.unload()
-            self._loaded_signature = None
+            self._loaded_model_key = None
 
     def _resolve_ksampler(
         self,
@@ -249,7 +264,7 @@ class DiffusionGenerator:
         combined_order: list[str] = []
 
         def register_adapter(spec: LoRASpec, weight: float) -> None:
-            spec_path = str(Path(spec.path).resolve()).casefold()
+            spec_path = path_key(spec.path)
             if spec_path not in combined_by_path:
                 combined_order.append(spec_path)
             combined_by_path[spec_path] = (spec, float(weight))
@@ -269,13 +284,10 @@ class DiffusionGenerator:
             lora_weights=combined_weights,
         )
 
-    def _signature(self, model: ModelSpec, loras: list[LoRASpec], weights: list[float], ksample: KSampleConfig) -> tuple[str, tuple[tuple[str, float], ...]]:
-        model_key = f"{Path(model.path).resolve().as_posix().casefold()}::{model.torch_dtype}::{ksample.sampler_name}::{ksample.scheduler}"
-        lora_key = tuple(
-            (Path(spec.path).resolve().as_posix().casefold(), float(weight))
-            for spec, weight in zip(loras, weights, strict=True)
-        )
-        return (model_key, lora_key)
+    def _model_key(self, model: ModelSpec, ksample: KSampleConfig) -> str:
+        """What requires a fresh pipeline: the model file, its dtype and the sampler/scheduler it was configured with
+        (LoRAs, IP-Adapters and textual inversions are updated on the loaded pipeline)."""
+        return f"{path_key(model.path)}::{model.torch_dtype}::{ksample.sampler_name}::{ksample.scheduler}"
 
     def _save_image(self, image: Image.Image, output_path: Path) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -288,4 +300,5 @@ __all__ = [
     "GenerationCancelled",
     "PromptEmbeddingResolutionError",
     "PromptLoRAResolutionError",
+    "ReferenceImageError",
 ]

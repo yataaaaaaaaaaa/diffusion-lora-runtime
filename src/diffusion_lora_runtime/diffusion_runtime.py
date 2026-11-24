@@ -24,14 +24,22 @@ from diffusers import (
 )
 from PIL import Image
 
-from .checkpoint_inspection import detect_single_file_architecture
+from .checkpoint_inspection import single_file_pipeline_architecture
+from .ip_adapter import architecture_mismatch_message, load_image_encoder
 from .prompt_embedding import (
     PromptEmbeddingReference,
     PromptEmbeddingResolutionError,
     load_prompt_embedding_file,
     resolve_prompt_embedding_vectors,
 )
-from .schemas import LoRASpec, ModelSpec, StepCallback, StepProgress
+from .schemas import (
+    IPAdapterSpec,
+    LoRASpec,
+    ModelSpec,
+    PipelineArchitectureName,
+    StepCallback,
+    StepProgress,
+)
 
 
 SAMPLER_NAME = "euler_ancestral"
@@ -53,10 +61,14 @@ class GenerationCancelled(RuntimeError):
     pass
 
 
+def path_key(path: str | Path) -> str:
+    """Comparison key of a file path (resolved, forward slashes, case-folded): two spellings of one file match."""
+    return Path(path).resolve().as_posix().casefold()
+
+
 @dataclass
 class LoadedAdapter:
     spec: LoRASpec
-    device: str = "cpu"
 
 
 @dataclass
@@ -66,15 +78,41 @@ class LoadedTextualInversion:
     tokens: list[str]
 
 
+@dataclass
+class LoadedIPAdapter:
+    """The IP-Adapter loaded into the pipeline (path keys, see path_key) and the scale applied to it (None: none yet)."""
+
+    adapter_key: str
+    image_encoder_key: str
+    scale: float | None = None
+
+
+@dataclass
+class CachedImageEncoder:
+    """The image encoder module of the last IP-Adapter load, kept so swapping adapters over the same encoder does not
+    read it again (``unload_ip_adapter`` drops the pipeline's own reference)."""
+
+    key: str
+    module: Any
+
+
 class DiffusionRuntime:
     def __init__(self, *, device: str = "auto", allow_cpu: bool = False) -> None:
         self.pipe: Any | None = None
         self.current_model: ModelSpec | None = None
+        # Effective dtype the current pipeline was loaded with (image encoders are created with it).
+        self.current_torch_dtype: Any | None = None
+        # True when the current pipeline runs with model CPU offload hooks (see _place_pipeline_on_device).
+        self.model_cpu_offload = False
         self.loaded_adapters: dict[str, LoadedAdapter] = {}
         self.loaded_textual_inversions: dict[str, LoadedTextualInversion] = {}
         self.active_adapter_signature: (
             tuple[tuple[str, ...], tuple[float, ...]] | None
         ) = None
+        # True after disable_lora(): the next non-empty LoRA set has to enable LoRA layers again.
+        self._lora_disabled = False
+        self.loaded_ip_adapter: LoadedIPAdapter | None = None
+        self._image_encoder: CachedImageEncoder | None = None
         self._cancel_event = threading.Event()
         self._operation_lock = threading.RLock()
         self.requested_device = device
@@ -165,7 +203,7 @@ class DiffusionRuntime:
     def _single_file_pipeline_class(self, model_path: Path) -> type[Any]:
         """SD 1.x checkpoints load as StableDiffusionPipeline; SDXL checkpoints (Pony, Illustrious, ...) and files
         whose family cannot be detected (e.g. ``.ckpt``) keep loading as StableDiffusionXLPipeline."""
-        if detect_single_file_architecture(model_path) == "sd15":
+        if single_file_pipeline_architecture(model_path) == "sd15":
             return StableDiffusionPipeline
         return StableDiffusionXLPipeline
 
@@ -205,6 +243,7 @@ class DiffusionRuntime:
 
     def _place_pipeline_on_device(self) -> None:
         assert self.pipe is not None
+        self.model_cpu_offload = False
         if (
             MODEL_CPU_OFFLOAD
             and hasattr(self.pipe, "enable_model_cpu_offload")
@@ -212,10 +251,27 @@ class DiffusionRuntime:
         ):
             try:
                 self.pipe.enable_model_cpu_offload()
+                self.model_cpu_offload = True
                 return
             except ImportError:
                 pass
         self.pipe = self.pipe.to(self.device)
+
+    def _refresh_model_cpu_offload(self) -> None:
+        """Rebuild the offload hook chain after a model component was added or removed (``image_encoder``);
+        ``enable_model_cpu_offload`` removes the previous hooks itself. No-op without model CPU offload."""
+        assert self.pipe is not None
+        if self.model_cpu_offload:
+            self.pipe.enable_model_cpu_offload()
+
+    def _reset_pipeline_state(self) -> None:
+        """Forget everything loaded into the previous pipeline (a new pipeline starts without adapters)."""
+        self.loaded_adapters.clear()
+        self.loaded_textual_inversions.clear()
+        self.active_adapter_signature = None
+        self._lora_disabled = False
+        self.loaded_ip_adapter = None
+        self._image_encoder = None
 
     def ensure_model(self, model: ModelSpec) -> None:
         if (
@@ -237,18 +293,17 @@ class DiffusionRuntime:
         if hasattr(self.pipe, "enable_attention_slicing"):
             self.pipe.enable_attention_slicing()
         self.current_model = model
-        self.loaded_adapters.clear()
-        self.loaded_textual_inversions.clear()
-        self.active_adapter_signature = None
+        self.current_torch_dtype = torch_dtype
+        self._reset_pipeline_state()
 
     def unload(self) -> None:
-        """Release the current pipeline, adapters, textual inversions, and CUDA cache."""
+        """Release the current pipeline, adapters (LoRA and IP-Adapter), textual inversions, and CUDA cache."""
         pipe = self.pipe
         self.pipe = None
         self.current_model = None
-        self.loaded_adapters.clear()
-        self.loaded_textual_inversions.clear()
-        self.active_adapter_signature = None
+        self.current_torch_dtype = None
+        self.model_cpu_offload = False
+        self._reset_pipeline_state()
         self._cancel_event.clear()
         if pipe is not None:
             try:
@@ -459,10 +514,35 @@ class DiffusionRuntime:
             logger.exception(
                 "Failed to load LoRA adapter '%s' from '%s'. %s", spec.id, path, summary
             )
+            self._discard_partial_adapter(spec.id)
             raise AdapterLoadError(
                 f"Failed to load LoRA '{spec.name}' from '{path}': {exc}. {summary}.{guidance}"
             ) from exc
-        self.loaded_adapters[spec.id] = LoadedAdapter(spec=spec, device=self.device)
+        self.loaded_adapters[spec.id] = LoadedAdapter(spec=spec)
+
+    def _discard_partial_adapter(self, adapter_id: str) -> None:
+        """Best effort after a failed load: remove what the loader may have injected under ``adapter_id`` (e.g. the
+        UNet part of an SDXL LoRA whose text encoder part failed) so a later load can reuse the name."""
+        assert self.pipe is not None
+        if not hasattr(self.pipe, "delete_adapters"):
+            return
+        try:
+            self.pipe.delete_adapters([adapter_id])
+        except Exception:
+            logger.debug("Nothing to discard for LoRA adapter '%s'.", adapter_id, exc_info=True)
+
+    def _delete_adapters(self, adapter_ids: list[str]) -> None:
+        """Delete LoRA adapters from the pipeline (frees their weights) and from the bookkeeping (kept on failure, so
+        the next request deletes them again)."""
+        assert self.pipe is not None
+        try:
+            self.pipe.delete_adapters(adapter_ids)
+        except Exception as exc:
+            logger.exception("Failed to delete LoRA adapters %s.", adapter_ids)
+            names = ", ".join(self.loaded_adapters[adapter_id].spec.name for adapter_id in adapter_ids)
+            raise AdapterLoadError(f"Failed to remove LoRA {names}: {exc}") from exc
+        for adapter_id in adapter_ids:
+            del self.loaded_adapters[adapter_id]
 
     def _encoder_embedding_width(self, text_encoder: Any) -> int:
         return int(text_encoder.get_input_embeddings().weight.shape[1])
@@ -597,55 +677,176 @@ class DiffusionRuntime:
         requested: list[LoRASpec],
         adapter_weights: list[float] | None = None,
     ) -> list[str]:
+        """Make ``requested`` the active LoRA set with ``adapter_weights``, incrementally (the base model is kept):
+
+        - an unchanged request (same ids, order and weights as the applied signature) calls nothing;
+        - adapters no longer requested (or whose id now names another file) are deleted from the pipeline
+          (``delete_adapters``: memory stays bounded), new ones are loaded; adapters kept are never reloaded;
+        - ``set_adapters(ids, weights)`` applies the set, so a weight-only change calls nothing else;
+        - an empty request deletes every adapter and calls ``disable_lora()``; the next non-empty set enables LoRA
+          layers again (``enable_lora()``).
+        """
         assert self.pipe is not None
         requested_ids = [spec.id for spec in requested]
         resolved_weights = adapter_weights or [LORA_WEIGHT] * len(requested)
         if len(resolved_weights) != len(requested):
             raise ValueError("adapter_weights length must match requested adapters.")
 
-        if not requested_ids:
-            if hasattr(self.pipe, "disable_lora"):
-                self.pipe.disable_lora()
-            self.active_adapter_signature = ((), ())
-            return []
-
-        for spec in requested:
-            loaded = self.loaded_adapters.get(spec.id)
-            if loaded is None:
-                self._load_single_adapter(spec)
-            elif loaded.device != self.device and hasattr(self.pipe, "set_lora_device"):
-                self.pipe.set_lora_device(adapter_names=[spec.id], device=self.device)
-                loaded.device = self.device
-
-        inactive_ids = [
-            adapter_id
-            for adapter_id in self.loaded_adapters.keys()
-            if adapter_id not in requested_ids
-        ]
-        if (
-            inactive_ids
-            and hasattr(self.pipe, "set_lora_device")
-            and self.device.startswith("cuda")
-        ):
-            self.pipe.set_lora_device(adapter_names=inactive_ids, device="cpu")
-            for adapter_id in inactive_ids:
-                self.loaded_adapters[adapter_id].device = "cpu"
-
         requested_signature = (
             tuple(requested_ids),
             tuple(float(weight) for weight in resolved_weights),
         )
-        if self.active_adapter_signature == requested_signature:
-            if hasattr(self.pipe, "enable_lora"):
-                self.pipe.enable_lora()
+        requested_by_id = {spec.id: spec for spec in requested}
+        stale_ids = [
+            adapter_id
+            for adapter_id, loaded in self.loaded_adapters.items()
+            if adapter_id not in requested_by_id
+            or path_key(loaded.spec.path) != path_key(requested_by_id[adapter_id].path)
+        ]
+        if not stale_ids and self.active_adapter_signature == requested_signature:
             return requested_ids
 
+        # Unknown until the new set is fully applied (a failed load must not look applied on the next call).
+        self.active_adapter_signature = None
+        if stale_ids:
+            self._delete_adapters(stale_ids)
+        for spec in requested:
+            if spec.id not in self.loaded_adapters:
+                self._load_single_adapter(spec)
+
+        if not requested_ids:
+            if hasattr(self.pipe, "disable_lora"):
+                self.pipe.disable_lora()
+                self._lora_disabled = True
+            self.active_adapter_signature = requested_signature
+            return []
+
         with torch.no_grad():
-            self.pipe.set_adapters(requested_ids, adapter_weights=resolved_weights)
-        if hasattr(self.pipe, "enable_lora"):
+            self.pipe.set_adapters(requested_ids, adapter_weights=list(requested_signature[1]))
+        if self._lora_disabled and hasattr(self.pipe, "enable_lora"):
             self.pipe.enable_lora()
+            self._lora_disabled = False
         self.active_adapter_signature = requested_signature
         return requested_ids
+
+    def _pipeline_architecture(self) -> PipelineArchitectureName:
+        """Family of the loaded pipeline: SDXL pipelines have two tokenizer/text encoder pairs, SD 1.x one."""
+        return "sdxl" if self._supports_long_prompt_embeds() else "sd15"
+
+    @contextmanager
+    def _ip_adapter_errors(self, action: str):
+        """Report any failure of an IP-Adapter pipeline operation as AdapterLoadError."""
+        try:
+            yield
+        except AdapterLoadError:
+            raise
+        except Exception as exc:
+            logger.exception("Failed to %s.", action)
+            raise AdapterLoadError(f"Failed to {action}: {exc}") from exc
+
+    def ensure_ip_adapter(self, spec: IPAdapterSpec | None) -> None:
+        """Make ``spec`` the pipeline's IP-Adapter (None: none), without ever reloading the base model:
+
+        - None while one is loaded: ``unload_ip_adapter()`` (and the cached image encoder is released);
+        - ``spec.architecture`` is checked against the loaded pipeline family (AdapterLoadError on mismatch);
+        - another adapter or image encoder than the loaded one: unload it, then load ``spec`` (the image encoder module
+          is reused when its path is unchanged);
+        - ``set_ip_adapter_scale`` whenever the scale differs from the applied one (a scale-only change calls nothing
+          else).
+
+        Every pipeline failure is raised as AdapterLoadError.
+        """
+        assert self.pipe is not None
+        if spec is None:
+            if self.loaded_ip_adapter is not None:
+                with self._ip_adapter_errors("unload the IP-Adapter"):
+                    self._unload_ip_adapter()
+                    self._refresh_model_cpu_offload()
+            self._image_encoder = None
+            return
+
+        pipeline_architecture = self._pipeline_architecture()
+        if spec.architecture is not None and spec.architecture != pipeline_architecture:
+            raise AdapterLoadError(architecture_mismatch_message(spec.architecture, pipeline_architecture))
+
+        requested = (path_key(spec.adapter_path), path_key(spec.image_encoder_path))
+        loaded = self.loaded_ip_adapter
+        if loaded is not None and (loaded.adapter_key, loaded.image_encoder_key) != requested:
+            with self._ip_adapter_errors("unload the previous IP-Adapter"):
+                self._unload_ip_adapter()
+            loaded = None
+        if loaded is None:
+            loaded = self._load_ip_adapter(spec)
+
+        scale = float(spec.scale)
+        if loaded.scale != scale:
+            with self._ip_adapter_errors("set the IP-Adapter scale"):
+                self.pipe.set_ip_adapter_scale(scale)
+            loaded.scale = scale
+
+    def _unload_ip_adapter(self) -> None:
+        assert self.pipe is not None
+        self.pipe.unload_ip_adapter()
+        self.loaded_ip_adapter = None
+
+    def _load_ip_adapter(self, spec: IPAdapterSpec) -> LoadedIPAdapter:
+        """Register the image encoder, then load the adapter weights from their folder (diffusers skips loading its own
+        encoder when ``pipe.image_encoder`` is set and creates the CLIPImageProcessor feature extractor itself)."""
+        assert self.pipe is not None
+        adapter = Path(spec.adapter_path)
+        registered = False
+        with self._ip_adapter_errors(
+            f"load IP-Adapter '{adapter.name}' with image encoder '{Path(spec.image_encoder_path).name}'"
+        ):
+            try:
+                if not adapter.is_file():
+                    raise FileNotFoundError(f"IP-Adapter weights not found: {adapter}")
+                encoder = self._image_encoder_for(spec.image_encoder_path)
+                self.pipe.register_modules(image_encoder=encoder)
+                registered = True
+                self.pipe.load_ip_adapter(
+                    str(adapter.parent),
+                    subfolder="",
+                    weight_name=adapter.name,
+                    image_encoder_folder=None,
+                )
+                # image_encoder joins the offload hook chain (or is already on the device, see _image_encoder_for).
+                self._refresh_model_cpu_offload()
+            except Exception:
+                self._image_encoder = None
+                self._discard_partial_ip_adapter(registered=registered)
+                raise
+        loaded = LoadedIPAdapter(
+            adapter_key=path_key(adapter), image_encoder_key=path_key(spec.image_encoder_path)
+        )
+        self.loaded_ip_adapter = loaded
+        return loaded
+
+    def _discard_partial_ip_adapter(self, *, registered: bool) -> None:
+        """Best effort after a failed load: restore the attention processors and drop the registered encoder, and
+        rebuild the offload hooks (a previous adapter may have been unloaded just before)."""
+        assert self.pipe is not None
+        try:
+            if registered:
+                self.pipe.unload_ip_adapter()
+            self._refresh_model_cpu_offload()
+        except Exception:
+            logger.warning("Could not clean up after a failed IP-Adapter load.", exc_info=True)
+
+    def _image_encoder_for(self, path: str) -> Any:
+        """The image encoder module for ``path``: the cached one when the path is unchanged, else loaded with the
+        pipeline dtype, on the CPU under model CPU offload (the hooks move it) or on the device otherwise."""
+        key = path_key(path)
+        if self._image_encoder is not None and self._image_encoder.key == key:
+            return self._image_encoder.module
+        self._image_encoder = None  # release the previous encoder before reading the next one
+        module = load_image_encoder(
+            path,
+            torch_dtype=self.current_torch_dtype,
+            device="cpu" if self.model_cpu_offload else self.device,
+        )
+        self._image_encoder = CachedImageEncoder(key=key, module=module)
+        return module
 
     def _supports_long_prompt_embeds(self) -> bool:
         assert self.pipe is not None
@@ -817,8 +1018,19 @@ class DiffusionRuntime:
         seed: int | None,
         progress_callback: Callable[[int, int], None] | None = None,
         step_callback: StepCallback | None = None,
+        ip_adapter_images: list[Image.Image] | None = None,
     ) -> tuple[Image.Image, int]:
+        """``ip_adapter_images``: reference images of the IP-Adapter loaded by ensure_ip_adapter (one or more, in
+        order), passed as the pipeline's ``ip_adapter_image`` (one list per adapter). Required exactly when an
+        IP-Adapter is loaded."""
         assert self.pipe is not None
+        if ip_adapter_images is not None:
+            if not ip_adapter_images:
+                raise ValueError("ip_adapter_images must contain at least one image.")
+            if self.loaded_ip_adapter is None:
+                raise ValueError("ip_adapter_images were given but no IP-Adapter is loaded (see ensure_ip_adapter).")
+        elif self.loaded_ip_adapter is not None:
+            raise ValueError("An IP-Adapter is loaded: pass its ip_adapter_images or unload it (ensure_ip_adapter(None)).")
 
         prompt = self.expand_prompt_embeddings(prompt)
         negative_prompt = self.expand_prompt_embeddings(negative_prompt)
@@ -848,6 +1060,8 @@ class DiffusionRuntime:
                     "negative_prompt": negative_prompt or None,
                 }
             )
+        if ip_adapter_images is not None:
+            call_kwargs["ip_adapter_image"] = [list(ip_adapter_images)]
 
         last_notified_step: int | None = None
 

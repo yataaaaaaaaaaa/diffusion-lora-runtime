@@ -8,6 +8,8 @@ from typing import Callable, Literal
 from PIL import Image
 
 TorchDTypeName = Literal["float16", "bfloat16", "float32"]
+# Pipeline families (same values as checkpoint_inspection.SingleFileArchitecture, which owns the detection rule).
+PipelineArchitectureName = Literal["sd15", "sdxl"]
 DeviceName = str
 
 DEFAULT_SINGLE_FILE_CONFIG = "stabilityai/stable-diffusion-xl-base-1.0"
@@ -33,6 +35,28 @@ class LoRASpec:
             path=str(resolved_path),
             weight=float(weight),
         )
+
+
+@dataclass(frozen=True)
+class IPAdapterSpec:
+    """IP-Adapter conditioning of one generation: reference images that guide the image through an IP-Adapter.
+
+    - ``adapter_path``: IP-Adapter weights (h94/IP-Adapter ``.safetensors`` / ``.bin``, e.g.
+      ``ip-adapter-plus-face_sdxl_vit-h.safetensors``);
+    - ``image_encoder_path``: the CLIP vision encoder the adapter was trained with: a single ``.safetensors`` file in
+      the transformers key layout (ComfyUI ``clip_vision`` files such as ``CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors``,
+      loaded with the ViT-H/14 configuration) or a transformers folder with its ``config.json``;
+    - ``image_paths``: reference images (at least one), in order;
+    - ``scale``: adapter strength (diffusers ``set_ip_adapter_scale``);
+    - ``architecture``: the pipeline family the adapter was made for, checked against the loaded pipeline (None: not
+      checked).
+    """
+
+    adapter_path: str
+    image_encoder_path: str
+    image_paths: tuple[str, ...]
+    scale: float = 0.6
+    architecture: PipelineArchitectureName | None = None
 
 
 @dataclass(frozen=True)

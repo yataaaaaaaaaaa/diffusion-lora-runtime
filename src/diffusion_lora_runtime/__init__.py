@@ -1,8 +1,8 @@
 """diffusion-lora-runtime public API.
 
 Public names are resolved lazily (PEP 562): importing the package, or one of its torch-free modules
-(``prompt_lora``, ``normalization``, ``prompt_assets``, ``schemas``, ``checkpoint_inspection``), never imports
-torch or diffusers. They are only loaded when a name that needs them (``DiffusionGenerator``,
+(``prompt_lora``, ``normalization``, ``prompt_assets``, ``schemas``, ``checkpoint_inspection``, ``ip_adapter``),
+never imports torch or diffusers. They are only loaded when a name that needs them (``DiffusionGenerator``,
 ``AdapterLoadError``, ``GenerationCancelled``, ``PromptEmbeddingResolutionError``) is first accessed. Consumers
 can therefore reuse the prompt syntax helpers (``diffusion_lora_runtime.prompt_lora``) without loading torch.
 """
@@ -19,7 +19,9 @@ _EXPORTS: dict[str, str] = {
     "DiffusionGenerator": "generator",
     "PromptEmbeddingResolutionError": "prompt_embedding",
     "PromptLoRAResolutionError": "prompt_lora",
+    "ReferenceImageError": "ip_adapter",
     "GenerateResult": "schemas",
+    "IPAdapterSpec": "schemas",
     "KSampleConfig": "schemas",
     "LoRASpec": "schemas",
     "ModelSpec": "schemas",
@@ -28,6 +30,8 @@ _EXPORTS: dict[str, str] = {
     "SafetensorsHeaderError": "checkpoint_inspection",
     "SingleFileArchitecture": "checkpoint_inspection",
     "detect_single_file_architecture": "checkpoint_inspection",
+    "pipeline_architecture": "checkpoint_inspection",
+    "single_file_pipeline_architecture": "checkpoint_inspection",
     "read_safetensors_keys": "checkpoint_inspection",
 }
 
@@ -52,10 +56,21 @@ if TYPE_CHECKING:  # static analysers see eager imports
         SafetensorsHeaderError,
         SingleFileArchitecture,
         detect_single_file_architecture,
+        pipeline_architecture,
         read_safetensors_keys,
+        single_file_pipeline_architecture,
     )
     from .diffusion_runtime import AdapterLoadError, GenerationCancelled
     from .generator import DiffusionGenerator
+    from .ip_adapter import ReferenceImageError
     from .prompt_embedding import PromptEmbeddingResolutionError
     from .prompt_lora import PromptLoRAResolutionError
-    from .schemas import GenerateResult, KSampleConfig, LoRASpec, ModelSpec, PromptAssetPaths, StepProgress
+    from .schemas import (
+        GenerateResult,
+        IPAdapterSpec,
+        KSampleConfig,
+        LoRASpec,
+        ModelSpec,
+        PromptAssetPaths,
+        StepProgress,
+    )

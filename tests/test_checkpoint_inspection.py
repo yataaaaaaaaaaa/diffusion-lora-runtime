@@ -10,7 +10,9 @@ import pytest
 from diffusion_lora_runtime import (
     SafetensorsHeaderError,
     detect_single_file_architecture,
+    pipeline_architecture,
     read_safetensors_keys,
+    single_file_pipeline_architecture,
 )
 from diffusion_lora_runtime.checkpoint_inspection import MAX_SAFETENSORS_HEADER_BYTES
 
@@ -104,3 +106,54 @@ def test_inspection_module_does_not_import_torch() -> None:
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
 
     assert result.stdout.strip() == "False False"
+
+
+# -- pipeline_architecture: the family the runtime loads a model as ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("keys", "expected"),
+    [(SD15_KEYS, "sd15"), (SDXL_KEYS, "sdxl"), (SD21_KEYS, "sdxl"), (FLUX_KEYS, "sdxl")],
+    ids=["sd15", "sdxl", "undetected-sd2", "undetected-flux"],
+)
+def test_single_files_load_as_sd15_or_else_sdxl(tmp_path: Path, keys: list[str], expected: str) -> None:
+    path = write_safetensors(tmp_path / "model.safetensors", keys)
+
+    assert single_file_pipeline_architecture(path) == expected
+    assert pipeline_architecture(path) == expected
+
+
+def test_pickle_checkpoints_load_as_sdxl(tmp_path: Path) -> None:
+    path = tmp_path / "legacy.ckpt"
+    path.write_bytes(b"not inspected")
+
+    assert pipeline_architecture(path) == "sdxl"
+
+
+@pytest.mark.parametrize(
+    ("class_name", "expected"),
+    [
+        ("StableDiffusionXLPipeline", "sdxl"),
+        ("StableDiffusionXLImg2ImgPipeline", "sdxl"),
+        ("StableDiffusionPipeline", "sd15"),
+        ("StableDiffusion3Pipeline", None),
+        ("FluxPipeline", None),
+    ],
+)
+def test_diffusers_folders_use_their_model_index(tmp_path: Path, class_name: str, expected: str | None) -> None:
+    folder = tmp_path / "diffusers-model"
+    folder.mkdir()
+    (folder / "model_index.json").write_text(f'{{"_class_name": "{class_name}"}}', encoding="utf-8")
+
+    assert pipeline_architecture(folder) == expected
+
+
+@pytest.mark.parametrize("content", [None, "not json", "[1, 2]", '{"_class_name": 3}'], ids=["missing", "invalid", "list", "number"])
+def test_unreadable_diffusers_folders_and_missing_paths_are_unknown(tmp_path: Path, content: str | None) -> None:
+    folder = tmp_path / "diffusers-model"
+    folder.mkdir()
+    if content is not None:
+        (folder / "model_index.json").write_text(content, encoding="utf-8")
+
+    assert pipeline_architecture(folder) is None
+    assert pipeline_architecture(tmp_path / "missing.safetensors") is None

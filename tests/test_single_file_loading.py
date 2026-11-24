@@ -1,94 +1,29 @@
 """DiffusionRuntime.ensure_model picks the Diffusers pipeline class from the checkpoint's family, and both
-single-file loaders share one scheduler configuration. Diffusers is replaced by recording fakes."""
+single-file loaders share one scheduler configuration. Diffusers is replaced by the recording fakes of conftest.py."""
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import pytest
 import torch  # the stub of tests/conftest.py
 
 from diffusion_lora_runtime import ModelSpec
-from diffusion_lora_runtime import diffusion_runtime as runtime_module
 from diffusion_lora_runtime.diffusion_runtime import DiffusionRuntime
 
 from checkpoint_files import SD15_KEYS, SD21_KEYS, SDXL_KEYS, write_safetensors
+from conftest import (
+    CHECKPOINT_SCHEDULER_CONFIG,
+    FakeAutoPipeline,
+    FakeEuler,
+    FakeEulerAncestral,
+    FakePipeline,
+    FakeScheduler,
+    FakeSD15Pipeline,
+    FakeSDXLPipeline,
+)
 
-CHECKPOINT_SCHEDULER_CONFIG = {"num_train_timesteps": 1000}
-
-
-class FakeScheduler:
-    def __init__(self, config: dict[str, Any]) -> None:
-        self.config = config
-
-    @classmethod
-    def from_config(cls, config: dict[str, Any], **overrides: Any) -> "FakeScheduler":
-        return cls({**config, **overrides})
-
-
-class FakeEulerAncestral(FakeScheduler):
-    pass
-
-
-class FakeEuler(FakeScheduler):
-    pass
-
-
-class FakePipeline:
-    """Records how it was loaded; behaves like a pipeline for ensure_model (scheduler, .to, attention slicing)."""
-
-    loads: list["FakePipeline"]
-
-    def __init__(self, source: str, kwargs: dict[str, Any], loader: str) -> None:
-        self.source = source
-        self.kwargs = kwargs
-        self.loader = loader
-        self.scheduler: FakeScheduler = FakeScheduler(dict(CHECKPOINT_SCHEDULER_CONFIG))
-        self.device: str | None = None
-        self.attention_slicing = False
-
-    @classmethod
-    def from_single_file(cls, path: str, **kwargs: Any) -> "FakePipeline":
-        pipe = cls(path, kwargs, "from_single_file")
-        cls.loads.append(pipe)
-        return pipe
-
-    @classmethod
-    def from_pretrained(cls, path: str, **kwargs: Any) -> "FakePipeline":
-        pipe = cls(path, kwargs, "from_pretrained")
-        cls.loads.append(pipe)
-        return pipe
-
-    def to(self, device: str) -> "FakePipeline":
-        self.device = device
-        return self
-
-    def enable_attention_slicing(self) -> None:
-        self.attention_slicing = True
-
-
-class FakeSD15Pipeline(FakePipeline):
-    loads = []
-
-
-class FakeSDXLPipeline(FakePipeline):
-    loads = []
-
-
-class FakeAutoPipeline(FakePipeline):
-    loads = []
-
-
-@pytest.fixture(autouse=True)
-def fake_diffusers(monkeypatch: pytest.MonkeyPatch) -> None:
-    for pipeline_class in (FakeSD15Pipeline, FakeSDXLPipeline, FakeAutoPipeline):
-        monkeypatch.setattr(pipeline_class, "loads", [])
-    monkeypatch.setattr(runtime_module, "StableDiffusionPipeline", FakeSD15Pipeline)
-    monkeypatch.setattr(runtime_module, "StableDiffusionXLPipeline", FakeSDXLPipeline)
-    monkeypatch.setattr(runtime_module, "AutoPipelineForText2Image", FakeAutoPipeline)
-    monkeypatch.setattr(runtime_module, "EulerAncestralDiscreteScheduler", FakeEulerAncestral)
-    monkeypatch.setattr(runtime_module, "EulerDiscreteScheduler", FakeEuler)
+pytestmark = pytest.mark.usefixtures("fake_diffusers")
 
 
 @pytest.fixture()

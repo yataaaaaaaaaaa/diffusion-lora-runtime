@@ -16,10 +16,17 @@ Copied/adapted from the source backend as directly as possible:
 Added for package use:
 
 - `generator.py` — a small public API with `generate()` and `unload()`.
-- `schemas.py` — `ModelSpec`, `LoRASpec`, `KSampleConfig`, `GenerateResult`, and path helpers.
-- `checkpoint_inspection.py` — reads a `.safetensors` header (pure Python, no torch) to tell SD 1.x from SDXL single-file checkpoints.
+- `schemas.py` — `ModelSpec`, `LoRASpec`, `IPAdapterSpec`, `KSampleConfig`, `GenerateResult`, and path helpers.
+- `checkpoint_inspection.py` — reads a `.safetensors` header (pure Python, no torch) to tell SD 1.x from SDXL single-file checkpoints, and owns the rule "which pipeline family does the runtime load this model as" (`pipeline_architecture`).
+- `ip_adapter.py` — IP-Adapter pieces that need no pipeline: the CLIP ViT-H/14 image encoder configuration, image encoder loading (ComfyUI single file or transformers folder) and reference image opening. Loading the adapter into a pipeline is `DiffusionRuntime.ensure_ip_adapter`.
 
-The package's public names are resolved lazily (PEP 562): `import diffusion_lora_runtime` and its torch-free modules (`prompt_lora`, `normalization`, `prompt_assets`, `schemas`, `checkpoint_inspection`) never import torch or diffusers; they load the first time a name that needs them (`DiffusionGenerator`, `AdapterLoadError`, `GenerationCancelled`, `PromptEmbeddingResolutionError`) is accessed.
+The package's public names are resolved lazily (PEP 562): `import diffusion_lora_runtime` and its torch-free modules (`prompt_lora`, `normalization`, `prompt_assets`, `schemas`, `checkpoint_inspection`, `ip_adapter`) never import torch or diffusers; they load the first time a name that needs them (`DiffusionGenerator`, `AdapterLoadError`, `GenerationCancelled`, `PromptEmbeddingResolutionError`) is accessed.
+
+## Changes in 0.4.0
+
+- IP-Adapter support: `generate(..., ip_adapter=IPAdapterSpec(...))` guides the image with reference images (SD 1.x and SDXL), see "IP-Adapter (reference images)".
+- LoRA changes no longer reload the model: only the added LoRAs are loaded, only the removed ones are deleted, and a weight-only change just re-applies the weights (see "Memory behavior").
+- `pipeline_architecture(path)` / `single_file_pipeline_architecture(path)`: the family (`"sd15"` / `"sdxl"`) the runtime loads a model as, torch-free, also used by the runtime's own loader.
 
 ## Installation
 
@@ -85,25 +92,69 @@ Important arguments:
 - `output_path`: optional image save path. If omitted, the image is returned but not saved.
 - `progress_callback`: optional callable receiving `(current_step, total_steps)`.
 - `step_callback`: optional callable receiving a `StepProgress(step, total_steps, timestep)` object after each scheduler step.
+- `ip_adapter`: optional `IPAdapterSpec`: reference images applied through an IP-Adapter (see below). `None` generates without one (an IP-Adapter loaded by an earlier call is unloaded; the base model stays loaded).
 
 Shortcut overrides are also accepted: `width`, `height`, `steps`, `cfg`, and `seed`. They override the values inside `ksample` for that call.
 
 ### `DiffusionGenerator.unload()`
 
-Cancels any current generation flag, drops the Diffusers pipeline, clears adapter/textual-inversion bookkeeping, runs `gc.collect()`, and empties the CUDA cache when CUDA is available.
+Cancels any current generation flag, drops the Diffusers pipeline, clears LoRA / IP-Adapter / textual-inversion bookkeeping, runs `gc.collect()`, and empties the CUDA cache when CUDA is available.
 
 ### Checkpoint inspection
 
 ```python
-from diffusion_lora_runtime import detect_single_file_architecture, read_safetensors_keys
+from diffusion_lora_runtime import (
+    detect_single_file_architecture,
+    pipeline_architecture,
+    read_safetensors_keys,
+    single_file_pipeline_architecture,
+)
 
 detect_single_file_architecture("realisticVision.safetensors")  # "sd15"
 detect_single_file_architecture("illustriousXL.safetensors")    # "sdxl"
 detect_single_file_architecture("model.ckpt")                   # None (never parsed)
 read_safetensors_keys("model.safetensors")                       # tensor names, header order
+
+single_file_pipeline_architecture("model.ckpt")                 # "sdxl": undetected files load as SDXL
+pipeline_architecture("realisticVision.safetensors")             # "sd15"
+pipeline_architecture("diffusers-folder/")                       # from model_index.json "_class_name"
+pipeline_architecture("missing.safetensors")                     # None
 ```
 
-Both only read the safetensors header (8-byte little-endian length + JSON); no tensor is loaded and torch is not imported. `read_safetensors_keys` raises `SafetensorsHeaderError` for malformed headers; `detect_single_file_architecture` returns `None` for anything it cannot classify (see "Single-file checkpoints" below).
+They only read the safetensors header (8-byte little-endian length + JSON) or a Diffusers folder's `model_index.json`; no tensor is loaded and torch is not imported. `read_safetensors_keys` raises `SafetensorsHeaderError` for malformed headers; `detect_single_file_architecture` returns `None` for anything it cannot classify (see "Single-file checkpoints" below).
+
+`pipeline_architecture(path)` is the single owner of the rule "which pipeline family does the runtime load this model as": an existing file is `single_file_pipeline_architecture` (`"sd15"` for SD 1.x files, `"sdxl"` for everything else, exactly the pipeline class the loader picks); a Diffusers folder is `"sdxl"` for `StableDiffusionXL*` and `"sd15"` for `StableDiffusionPipeline` in its `model_index.json`, else `None`; a missing path is `None`. Consumers use it before any model is loaded, e.g. to pick an IP-Adapter made for that family.
+
+### IP-Adapter (reference images)
+
+```python
+from diffusion_lora_runtime import IPAdapterSpec
+
+result = engine.generate(
+    model_path=r"D:\Anything\models\illustriousXL.safetensors",
+    prompt="1girl, portrait",
+    ip_adapter=IPAdapterSpec(
+        adapter_path=r"D:\Anything\ComfyUI\ComfyUI\models\ipadapter\ip-adapter-plus-face_sdxl_vit-h.safetensors",
+        image_encoder_path=r"D:\Anything\ComfyUI\ComfyUI\models\clip_vision\CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors",
+        image_paths=("face_front.png", "face_side.png"),
+        scale=0.6,
+        architecture="sdxl",
+    ),
+)
+```
+
+`IPAdapterSpec` fields:
+
+- `adapter_path`: IP-Adapter weights in the h94/IP-Adapter layout (`.safetensors` with `image_proj.*` / `ip_adapter.*` keys, or `.bin`), e.g. `ip-adapter-plus-face_sdxl_vit-h.safetensors`, `ip-adapter-plus_sd15.safetensors`. They are loaded with Diffusers `load_ip_adapter(<folder>, subfolder="", weight_name=<file name>, image_encoder_folder=None)`.
+- `image_encoder_path`: the CLIP vision encoder the adapter was trained with (OpenCLIP ViT-H/14 for every `vit-h` / SD 1.5 h94 adapter), either
+  - a single `.safetensors` file in the transformers key layout (`vision_model.*`, `visual_projection.weight`), i.e. a ComfyUI `models/clip_vision` file such as `CLIP-ViT-H-14-laion2B-s32B-b79K.safetensors`: it carries no configuration, so it is built with `VIT_H_14_IMAGE_ENCODER_CONFIG` (the h94 `models/image_encoder/config.json`) and loaded strictly (a stored `vision_model.embeddings.position_ids` buffer is tolerated); the model is created without allocating weights and takes the file's tensors, so the 2.5 GB file is held in memory once;
+  - or a transformers model folder with its `config.json` (e.g. h94 `models/image_encoder`), loaded with `CLIPVisionModelWithProjection.from_pretrained`.
+  A file of another layout (e.g. OpenCLIP `visual.*` keys) raises `ImageEncoderLayoutError`.
+- `image_paths`: one or more reference images, in order. They are opened as RGB before anything is loaded; a missing or unreadable file (or none) raises `ReferenceImageError` (a `ValueError`). All of them go to the pipeline as one adapter's images (`ip_adapter_image=[[image, ...]]`).
+- `scale`: adapter strength (Diffusers `set_ip_adapter_scale`), default `0.6`.
+- `architecture`: `"sd15"` / `"sdxl"`, the family the adapter was made for, checked against the loaded pipeline (two text encoders: SDXL, one: SD 1.x). A mismatch raises `AdapterLoadError` ("IP-Adapter made for SDXL cannot be used with an SD 1.5 model."). `None` skips the check.
+
+Loading registers the image encoder (created with the pipeline dtype) on the pipeline before `load_ip_adapter`, so Diffusers does not look for its own encoder and creates the `CLIPImageProcessor` itself. Under model CPU offload the encoder is created on the CPU and `enable_model_cpu_offload()` is called again so it joins the offload hooks; otherwise it is placed on the device. Every IP-Adapter failure (missing weights, bad encoder, Diffusers errors) is raised as `AdapterLoadError`, after restoring the pipeline (`unload_ip_adapter`).
 
 
 ## Progress callbacks
@@ -168,11 +219,18 @@ If `allow_cpu=True` and the caller still asks for `float16` or `bfloat16`, the r
 
 ## Memory behavior
 
-`generate()` remembers the loaded model and LoRAs.
+`generate()` keeps the loaded model, LoRAs, IP-Adapter and textual inversions between calls, and only changes what a call changes:
 
-- Same model path + dtype + same resolved LoRA paths + same LoRA weights: reuse the already-loaded pipeline/adapters.
-- Different model path, dtype, LoRA path, or LoRA weight: unload the previous runtime first, then load the new signature.
+- Base model: only a different model path, dtype, sampler or scheduler unloads the previous pipeline (and everything loaded into it) before loading the new one.
+- LoRAs (explicit and inline prompt LoRAs, merged first) are updated in place, never by reloading the model:
+  - an unchanged set (same LoRAs, order and weights) calls nothing;
+  - only added LoRAs are loaded; only removed ones are deleted from the pipeline (`delete_adapters`, so memory stays bounded: nothing is parked on the CPU); a LoRA whose id now names another file is replaced;
+  - a weight-only change calls `set_adapters(ids, weights)` and nothing else;
+  - an empty set deletes the loaded LoRAs and calls `disable_lora()`; the next set enables LoRA layers again.
+- IP-Adapter: loaded, swapped (the previous one is unloaded first; the image encoder module is reused when its path is unchanged), re-scaled (`set_ip_adapter_scale` only) or unloaded (`ip_adapter=None`), never by reloading the model. Unloading also releases the cached image encoder.
+- Textual inversions stay loaded across LoRA and IP-Adapter changes.
 - Explicit LoRAs and inline prompt LoRAs are combined by resolved path. Inline tags can override a duplicate explicit LoRA's weight because this matches the original backend flow.
+- A failed LoRA load is cleaned up (`delete_adapters` of what was injected) and retried by the next request; a failed delete is reported as `AdapterLoadError` and retried too.
 - `unload()` always releases the current runtime state.
 
 ## Prompt resolution
@@ -262,9 +320,11 @@ Mapping to Diffusers:
 ## Validation performed in this environment
 
 - Python syntax check over `src` passed.
-- `pytest tests` (no GPU, no model files): Torch/Diffusers are stubbed in `tests/conftest.py`.
-  - `test_generator_memory.py`: model/LoRA reuse and progress callbacks.
-  - `test_checkpoint_inspection.py`: header parsing and SD 1.x / SDXL detection on tiny handcrafted `.safetensors` files.
+- `pytest tests` (no GPU, no model files): Torch/Diffusers are stubbed in `tests/conftest.py`, which also holds the recording Diffusers fakes (fixture `fake_diffusers`).
+  - `test_generator_memory.py`: only a base model change unloads; LoRA / IP-Adapter requests are passed on; reference images are checked first; progress callbacks.
+  - `test_adapter_updates.py`: incremental LoRA updates over a recording pipeline (weight-only change, add, remove, replace, unchanged, empty, model change, inline prompt LoRAs, failure clean-up).
+  - `test_ip_adapter.py`: IP-Adapter load / scale / swap / unload / architecture check / offload hooks / failures over a recording pipeline, the reference images given to the pipeline, `load_image_encoder` single-file vs folder branches with stubbed libraries, the ViT-H/14 configuration against the h94 `config.json` fixture, and a subprocess with the real torch / transformers / diffusers (skipped when not installed) running the image encoder loader and `DiffusionRuntime` over a tiny random SD 1.x pipeline.
+  - `test_checkpoint_inspection.py`: header parsing, SD 1.x / SDXL detection on tiny handcrafted `.safetensors` files, and `pipeline_architecture`.
   - `test_single_file_loading.py`: `ensure_model` picks the pipeline class from the detected family; shared scheduler configuration.
   - `test_textual_inversion.py`: single vs dual text-encoder registration; embedding vector resolution with real tensors (in a subprocess, skipped when torch is not installed).
   - `test_prompt_lora_syntax.py`: inline LoRA tag extraction and stripping, the lazy public API, and a subprocess check that `prompt_lora` imports without torch.
