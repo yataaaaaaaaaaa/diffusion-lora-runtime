@@ -22,6 +22,8 @@ class PromptLoRAResolutionError(RuntimeError):
 
 
 def extract_prompt_lora_specs(prompt: str) -> list[tuple[str, float]]:
+    """(name, weight) of every well-formed inline ``<lora:name:weight>`` / ``<lora:name>`` tag, in prompt order
+    (weight 1.0 when absent or unreadable). Torch-free: also used to read the prompts of other tools' images."""
     references: list[tuple[str, float]] = []
     for match in PROMPT_LORA_PATTERN.finditer(prompt):
         raw_name = match.group(1).strip()
@@ -69,6 +71,12 @@ def _cleanup_prompt_text(text: str) -> str:
     cleaned = re.sub(r",[ \t]+", ", ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return normalize_prompt_segment(cleaned)
+
+
+def strip_prompt_lora_tags(prompt: str) -> str:
+    """``prompt`` without its inline LoRA tags (every ``<lora:...>`` tag, malformed ones included), cleaned up
+    like a resolved prompt (no empty comma segments, no leading/trailing separators). Torch-free."""
+    return _cleanup_prompt_text(PROMPT_LORA_ANY_TAG_PATTERN.sub("", prompt))
 
 
 def resolve_prompt_loras(prompt: str, search_root: Path) -> PromptLoRAResolution:

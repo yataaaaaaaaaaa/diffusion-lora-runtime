@@ -19,6 +19,8 @@ Added for package use:
 - `schemas.py` — `ModelSpec`, `LoRASpec`, `KSampleConfig`, `GenerateResult`, and path helpers.
 - `checkpoint_inspection.py` — reads a `.safetensors` header (pure Python, no torch) to tell SD 1.x from SDXL single-file checkpoints.
 
+The package's public names are resolved lazily (PEP 562): `import diffusion_lora_runtime` and its torch-free modules (`prompt_lora`, `normalization`, `prompt_assets`, `schemas`, `checkpoint_inspection`) never import torch or diffusers; they load the first time a name that needs them (`DiffusionGenerator`, `AdapterLoadError`, `GenerationCancelled`, `PromptEmbeddingResolutionError`) is accessed.
+
 ## Installation
 
 From this folder:
@@ -192,6 +194,15 @@ Rules:
 - If `name.txt` exists beside the LoRA file, that text replaces the inline tag in the prompt.
 - The LoRA file is added to the resolved LoRA list with its parsed weight.
 
+The syntax itself is also available without any file lookup and without torch, for reading prompts written by other tools:
+
+```python
+from diffusion_lora_runtime.prompt_lora import extract_prompt_lora_specs, strip_prompt_lora_tags
+
+extract_prompt_lora_specs("castle, <lora:add_detail:0.6>, <lora:kim_v_1>")  # [("add_detail", 0.6), ("kim_v_1", 1.0)]
+strip_prompt_lora_tags("castle, <lora:add_detail:0.6>, sky")                 # "castle, sky"
+```
+
 ### Prompt embeddings / textual inversion
 
 Supported inline syntax:
@@ -256,4 +267,5 @@ Mapping to Diffusers:
   - `test_checkpoint_inspection.py`: header parsing and SD 1.x / SDXL detection on tiny handcrafted `.safetensors` files.
   - `test_single_file_loading.py`: `ensure_model` picks the pipeline class from the detected family; shared scheduler configuration.
   - `test_textual_inversion.py`: single vs dual text-encoder registration; embedding vector resolution with real tensors (in a subprocess, skipped when torch is not installed).
+  - `test_prompt_lora_syntax.py`: inline LoRA tag extraction and stripping, the lazy public API, and a subprocess check that `prompt_lora` imports without torch.
 - Real image inference was not run here because no local GPU/model assets were provided in the environment.
