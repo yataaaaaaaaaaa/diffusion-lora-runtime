@@ -91,12 +91,34 @@ def load_prompt_embedding_file(path: Path) -> Any:
     return torch.load(str(path), map_location="cpu", weights_only=False)
 
 
+def _split_generic_embedding(
+    generic: torch.Tensor,
+    *,
+    clip_l_dim: int,
+    clip_g_dim: int | None,
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """(clip_l, clip_g) for an embedding stored as one unnamed tensor, matched by its width."""
+    width = int(generic.shape[-1])
+    if width == clip_l_dim:
+        return generic, None
+    if clip_g_dim is not None and width == clip_g_dim:
+        return None, generic
+    expected = " or ".join(str(dim) for dim in (clip_l_dim, clip_g_dim) if dim is not None)
+    raise PromptEmbeddingResolutionError(f"Unsupported prompt embedding width {width}; expected {expected}.")
+
+
 def resolve_prompt_embedding_vectors(
     payload: Any,
     *,
     clip_l_dim: int,
-    clip_g_dim: int,
+    clip_g_dim: int | None,
 ) -> PromptEmbeddingVectors:
+    """Embedding vectors for the pipeline's text encoder(s).
+
+    ``clip_g_dim`` is the width of the second (OpenCLIP bigG) text encoder of SDXL pipelines, or ``None`` for
+    single text-encoder pipelines (SD 1.x): then only CLIP-L vectors are usable and ``clip_g`` is an empty
+    ``(tokens, 0)`` tensor.
+    """
     clip_l = None
     clip_g = None
 
@@ -119,32 +141,22 @@ def resolve_prompt_embedding_vectors(
                 if len(tensor_entries) == 1:
                     generic = tensor_entries[0]
             if generic is not None:
-                width = int(generic.shape[-1])
-                if width == clip_l_dim:
-                    clip_l = generic
-                elif width == clip_g_dim:
-                    clip_g = generic
-                else:
-                    raise PromptEmbeddingResolutionError(
-                        f"Unsupported prompt embedding width {width}; expected {clip_l_dim} or {clip_g_dim}."
-                    )
+                clip_l, clip_g = _split_generic_embedding(generic, clip_l_dim=clip_l_dim, clip_g_dim=clip_g_dim)
     else:
         generic = _normalize_embedding_tensor(payload)
         if generic is not None:
-            width = int(generic.shape[-1])
-            if width == clip_l_dim:
-                clip_l = generic
-            elif width == clip_g_dim:
-                clip_g = generic
-            else:
-                raise PromptEmbeddingResolutionError(
-                    f"Unsupported prompt embedding width {width}; expected {clip_l_dim} or {clip_g_dim}."
-                )
+            clip_l, clip_g = _split_generic_embedding(generic, clip_l_dim=clip_l_dim, clip_g_dim=clip_g_dim)
 
     if clip_l is None and clip_g is None:
         raise PromptEmbeddingResolutionError(
             "Unsupported prompt embedding file format. Expected ComfyUI/SDXL clip_l/clip_g tensors or a single embedding tensor."
         )
+    if clip_g_dim is None:
+        if clip_l is None:
+            raise PromptEmbeddingResolutionError(
+                "This prompt embedding only has SDXL clip_g vectors; the loaded model has a single CLIP-L text encoder."
+            )
+        clip_g = None
 
     token_count = max(
         int(clip_l.shape[0]) if clip_l is not None else 0,
@@ -164,7 +176,7 @@ def resolve_prompt_embedding_vectors(
 
     return PromptEmbeddingVectors(
         clip_l=aligned(clip_l, clip_l_dim),
-        clip_g=aligned(clip_g, clip_g_dim),
+        clip_g=aligned(clip_g, clip_g_dim or 0),
     )
 
 

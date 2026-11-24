@@ -1,45 +1,17 @@
 from __future__ import annotations
 
-import sys
 from contextlib import contextmanager
-from pathlib import Path
-from types import ModuleType, SimpleNamespace
 
-# The tests intentionally avoid importing real torch/diffusers so they can run
-# on machines without GPU/model dependencies. Runtime behavior is covered with a
-# fake runtime; real inference is integration-tested by calling Diffusers locally.
-
-torch_stub = ModuleType("torch")
-torch_stub.cuda = SimpleNamespace(is_available=lambda: False, empty_cache=lambda: None)
-torch_stub.backends = SimpleNamespace(mps=SimpleNamespace(is_available=lambda: False))
-torch_stub.version = SimpleNamespace(cuda=None)
-torch_stub.__version__ = "stub"
-torch_stub.float16 = object()
-torch_stub.bfloat16 = object()
-torch_stub.float32 = object()
-
-
-@contextmanager
-def no_grad():
-    yield
-
-
-torch_stub.no_grad = no_grad
-sys.modules.setdefault("torch", torch_stub)
-
-diffusers_stub = ModuleType("diffusers")
-diffusers_stub.AutoPipelineForText2Image = object
-diffusers_stub.EulerAncestralDiscreteScheduler = object
-diffusers_stub.EulerDiscreteScheduler = object
-diffusers_stub.StableDiffusionXLPipeline = object
-sys.modules.setdefault("diffusers", diffusers_stub)
-
-# Make editable source imports work when this file is run directly.
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
-
+# torch/diffusers are stubbed in tests/conftest.py.
 from PIL import Image
 
 from diffusion_lora_runtime import DiffusionGenerator, KSampleConfig, LoRASpec, StepProgress
+
+
+def make_engine() -> DiffusionGenerator:
+    """A generator whose runtime is replaced by FakeRuntime. CPU is allowed explicitly: the stubbed torch has no
+    accelerator, and the default constructor (rightly) refuses to fall back to CPU."""
+    return DiffusionGenerator(device="cpu", allow_cpu=True)
 
 
 class FakeRuntime:
@@ -84,7 +56,7 @@ class FakeRuntime:
 
 
 def test_generate_reuses_same_model_and_loras_until_signature_changes() -> None:
-    engine = DiffusionGenerator()
+    engine = make_engine()
     fake = FakeRuntime()
     engine.runtime = fake
 
@@ -105,7 +77,7 @@ def test_generate_reuses_same_model_and_loras_until_signature_changes() -> None:
 
 
 def test_generate_emits_progress_callbacks() -> None:
-    engine = DiffusionGenerator()
+    engine = make_engine()
     fake = FakeRuntime()
     engine.runtime = fake
 
@@ -122,8 +94,3 @@ def test_generate_emits_progress_callbacks() -> None:
     assert scalar_events == [(0, 2), (2, 2)]
     assert [event.step for event in step_events] == [0, 2]
 
-
-if __name__ == "__main__":
-    test_generate_reuses_same_model_and_loras_until_signature_changes()
-    test_generate_emits_progress_callbacks()
-    print("[OK] generator memory/progress behavior tests passed")

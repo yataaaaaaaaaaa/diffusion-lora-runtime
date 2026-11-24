@@ -8,15 +8,16 @@ This package keeps the part you asked for: diffusion model loading, LoRA loading
 
 Copied/adapted from the source backend as directly as possible:
 
-- `diffusion_runtime.py` — Diffusers runtime, SDXL/single-file model loading, LoRA adapters, textual inversion registration, long prompt embedding generation, sampler callback handling, image generation.
+- `diffusion_runtime.py` — Diffusers runtime, SD 1.x / SDXL single-file model loading, LoRA adapters, textual inversion registration, long prompt embedding generation, sampler callback handling, image generation.
 - `prompt_lora.py` — resolves `<lora:name:weight>` tags, searches LoRA files by filename stem, reads optional `.txt` sidecar text, and returns LoRA weights.
-- `prompt_embedding.py` — resolves `embedding:name` tags, loads `.safetensors`/`.pt` prompt embeddings, supports SDXL `clip_l`/`clip_g` tensors.
+- `prompt_embedding.py` — resolves `embedding:name` tags, loads `.safetensors`/`.pt` prompt embeddings, supports SDXL `clip_l`/`clip_g` tensors and single-tensor SD 1.x embeddings.
 - `prompt_assets.py` and `normalization.py` — strict recursive asset lookup and prompt cleanup helpers.
 
 Added for package use:
 
 - `generator.py` — a small public API with `generate()` and `unload()`.
 - `schemas.py` — `ModelSpec`, `LoRASpec`, `KSampleConfig`, `GenerateResult`, and path helpers.
+- `checkpoint_inspection.py` — reads a `.safetensors` header (pure Python, no torch) to tell SD 1.x from SDXL single-file checkpoints.
 
 ## Installation
 
@@ -88,6 +89,19 @@ Shortcut overrides are also accepted: `width`, `height`, `steps`, `cfg`, and `se
 ### `DiffusionGenerator.unload()`
 
 Cancels any current generation flag, drops the Diffusers pipeline, clears adapter/textual-inversion bookkeeping, runs `gc.collect()`, and empties the CUDA cache when CUDA is available.
+
+### Checkpoint inspection
+
+```python
+from diffusion_lora_runtime import detect_single_file_architecture, read_safetensors_keys
+
+detect_single_file_architecture("realisticVision.safetensors")  # "sd15"
+detect_single_file_architecture("illustriousXL.safetensors")    # "sdxl"
+detect_single_file_architecture("model.ckpt")                   # None (never parsed)
+read_safetensors_keys("model.safetensors")                       # tensor names, header order
+```
+
+Both only read the safetensors header (8-byte little-endian length + JSON); no tensor is loaded and torch is not imported. `read_safetensors_keys` raises `SafetensorsHeaderError` for malformed headers; `detect_single_file_architecture` returns `None` for anything it cannot classify (see "Single-file checkpoints" below).
 
 
 ## Progress callbacks
@@ -192,7 +206,8 @@ Rules:
 - Recursively searches files under `prompt_embedding_dir` by strict filename stem match.
 - Replaces the prompt text with generated `dlr_embed_*` tokens.
 - Loads SDXL `clip_l`/`clip_g` embedding tensors when available.
-- Registers textual inversion tokens into both SDXL tokenizers/text encoders.
+- SDXL pipelines: registers textual inversion tokens into both tokenizers/text encoders (a single-tensor 768-wide SD 1.x embedding fills `clip_l`, `clip_g` stays zero).
+- SD 1.x pipelines (one CLIP-L tokenizer/text encoder): registers the `clip_l` vectors only (A1111 `string_to_param`, a single tensor, or the `clip_l` part of an SDXL embedding); an embedding with only `clip_g` vectors is refused with `PromptEmbeddingResolutionError`.
 
 ## KSample config mapping
 
@@ -224,12 +239,21 @@ Mapping to Diffusers:
 ## Notes
 
 - Real image generation requires local model files and an environment with Torch/Diffusers installed.
-- Single-file checkpoints are loaded through `StableDiffusionXLPipeline.from_single_file(...)` as in the original backend.
+- Single-file checkpoints: the family is detected from the `.safetensors` header (`detect_single_file_architecture`):
+  - SD 1.x (`cond_stage_model.transformer.*` tensors, e.g. SD 1.5, SD 1.5 LCM/Hyper) loads through `StableDiffusionPipeline.from_single_file(...)`;
+  - SDXL (`conditioner.embedders.1.*` or `model.diffusion_model.label_emb.*` tensors: SDXL 1.0, Pony, Illustrious, NoobAI, ...) loads through `StableDiffusionXLPipeline.from_single_file(...)`;
+  - anything undetected (`.ckpt` files, SD 2.x, unknown layouts) keeps the original behavior: `StableDiffusionXLPipeline.from_single_file(...)`.
+  Both single-file loaders then apply the same scheduler configuration (`euler_ancestral` / `euler`, `timestep_spacing="leading"`, v-prediction by file name below). Diffusers model directories load with `AutoPipelineForText2Image.from_pretrained(...)` and keep their scheduler.
+- SD 1.x pipelines take the prompt as plain text (Diffusers truncates it at 77 tokens); the long-prompt chunked encoding is SDXL-only.
 - If a checkpoint filename contains `vpred`, `v-pred`, `v_prediction`, or `v-prediction`, the runtime forces `prediction_type="v_prediction"` and `rescale_betas_zero_snr=True`, copied from the original Illustrious-specific behavior.
 - Some ComfyUI LoRA/textual-inversion files may not be loadable by Diffusers. The original adapter error summarization was kept to make those failures easier to debug.
 
 ## Validation performed in this environment
 
 - Python syntax check over `src` passed.
-- Lightweight runtime-memory/progress test: `tests/test_generator_memory.py` passed with Torch/Diffusers stubs.
+- `pytest tests` (no GPU, no model files): Torch/Diffusers are stubbed in `tests/conftest.py`.
+  - `test_generator_memory.py`: model/LoRA reuse and progress callbacks.
+  - `test_checkpoint_inspection.py`: header parsing and SD 1.x / SDXL detection on tiny handcrafted `.safetensors` files.
+  - `test_single_file_loading.py`: `ensure_model` picks the pipeline class from the detected family; shared scheduler configuration.
+  - `test_textual_inversion.py`: single vs dual text-encoder registration; embedding vector resolution with real tensors (in a subprocess, skipped when torch is not installed).
 - Real image inference was not run here because no local GPU/model assets were provided in the environment.

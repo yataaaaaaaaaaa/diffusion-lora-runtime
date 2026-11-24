@@ -1,3 +1,9 @@
+from .checkpoint_inspection import (
+    SafetensorsHeaderError,
+    SingleFileArchitecture,
+    detect_single_file_architecture,
+    read_safetensors_keys,
+)
 from .diffusion_runtime import AdapterLoadError, GenerationCancelled
 from .generator import DiffusionGenerator
 from .prompt_embedding import PromptEmbeddingResolutionError
@@ -16,4 +22,8 @@ __all__ = [
     "StepProgress",
     "PromptEmbeddingResolutionError",
     "PromptLoRAResolutionError",
+    "SafetensorsHeaderError",
+    "SingleFileArchitecture",
+    "detect_single_file_architecture",
+    "read_safetensors_keys",
 ]

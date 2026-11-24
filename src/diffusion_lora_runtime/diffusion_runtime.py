@@ -19,10 +19,12 @@ from diffusers import (
     AutoPipelineForText2Image,
     EulerAncestralDiscreteScheduler,
     EulerDiscreteScheduler,
+    StableDiffusionPipeline,
     StableDiffusionXLPipeline,
 )
 from PIL import Image
 
+from .checkpoint_inspection import detect_single_file_architecture
 from .prompt_embedding import (
     PromptEmbeddingReference,
     PromptEmbeddingResolutionError,
@@ -160,15 +162,26 @@ class DiffusionRuntime:
         normalized_name = model_path.name.casefold()
         return any(marker in normalized_name for marker in ILLUSTRIOUS_V_PRED_MARKERS)
 
-    def _load_illustrious_single_file_pipeline(
-        self, model_path: Path, torch_dtype: torch.dtype
-    ) -> StableDiffusionXLPipeline:
-        pipe = StableDiffusionXLPipeline.from_single_file(
+    def _single_file_pipeline_class(self, model_path: Path) -> type[Any]:
+        """SD 1.x checkpoints load as StableDiffusionPipeline; SDXL checkpoints (Pony, Illustrious, ...) and files
+        whose family cannot be detected (e.g. ``.ckpt``) keep loading as StableDiffusionXLPipeline."""
+        if detect_single_file_architecture(model_path) == "sd15":
+            return StableDiffusionPipeline
+        return StableDiffusionXLPipeline
+
+    def _load_single_file_pipeline(self, model_path: Path, torch_dtype: torch.dtype) -> Any:
+        pipeline_class = self._single_file_pipeline_class(model_path)
+        pipe = pipeline_class.from_single_file(
             str(model_path),
             use_safetensors=ILLUSTRIOUS_USE_SAFETENSORS,
             torch_dtype=torch_dtype,
         )
+        self._configure_scheduler(pipe, model_path)
+        return pipe
 
+    def _configure_scheduler(self, pipe: Any, model_path: Path) -> None:
+        """Replace the checkpoint's scheduler with the configured KSample sampler (v-prediction when the
+        checkpoint file name says so)."""
         if (
             ILLUSTRIOUS_FORCE_V_PREDICTION_BY_NAME
             and self._looks_like_v_prediction_checkpoint(model_path)
@@ -189,8 +202,6 @@ class DiffusionRuntime:
                 pipe.scheduler.config,
                 timestep_spacing="leading",
             )
-
-        return pipe
 
     def _place_pipeline_on_device(self) -> None:
         assert self.pipe is not None
@@ -217,9 +228,7 @@ class DiffusionRuntime:
         torch_dtype = self._effective_torch_dtype(model)
         model_path = Path(model.path)
         if model_path.is_file():
-            self.pipe = self._load_illustrious_single_file_pipeline(
-                model_path, torch_dtype
-            )
+            self.pipe = self._load_single_file_pipeline(model_path, torch_dtype)
         else:
             self.pipe = AutoPipelineForText2Image.from_pretrained(
                 str(model_path), torch_dtype=torch_dtype
@@ -510,33 +519,41 @@ class DiffusionRuntime:
         self, reference: PromptEmbeddingReference
     ) -> None:
         assert self.pipe is not None
-        if not self._supports_long_prompt_embeds():
+        # SDXL: two tokenizer/text encoder pairs (CLIP-L + OpenCLIP bigG); SD 1.x: one CLIP-L pair.
+        dual_encoder = self._supports_long_prompt_embeds()
+        if not dual_encoder and not all(
+            hasattr(self.pipe, attribute) for attribute in ("tokenizer", "text_encoder")
+        ):
             raise PromptEmbeddingResolutionError(
-                "Prompt embeddings require a dual-encoder pipeline with tokenizer/text encoder pairs."
+                "Prompt embeddings require a pipeline with a tokenizer/text encoder pair."
             )
 
         state = load_prompt_embedding_file(reference.path)
         vectors = resolve_prompt_embedding_vectors(
             state,
             clip_l_dim=self._encoder_embedding_width(self.pipe.text_encoder),
-            clip_g_dim=self._encoder_embedding_width(self.pipe.text_encoder_2),
+            clip_g_dim=(
+                self._encoder_embedding_width(self.pipe.text_encoder_2)
+                if dual_encoder
+                else None
+            ),
         )
 
-        token_names_a = self._register_textual_inversion_tokens(
+        token_names = self._register_textual_inversion_tokens(
             self.pipe.tokenizer,
             self.pipe.text_encoder,
             reference.token,
             vectors.clip_l,
         )
-        token_names_b = self._register_textual_inversion_tokens(
-            self.pipe.tokenizer_2,
-            self.pipe.text_encoder_2,
-            reference.token,
-            vectors.clip_g,
-        )
-        token_names = (
-            token_names_a if len(token_names_a) >= len(token_names_b) else token_names_b
-        )
+        if dual_encoder:
+            token_names_b = self._register_textual_inversion_tokens(
+                self.pipe.tokenizer_2,
+                self.pipe.text_encoder_2,
+                reference.token,
+                vectors.clip_g,
+            )
+            if len(token_names_b) > len(token_names):
+                token_names = token_names_b
 
         resolved = str(reference.path.resolve()).casefold()
         self.loaded_textual_inversions[resolved] = LoadedTextualInversion(
